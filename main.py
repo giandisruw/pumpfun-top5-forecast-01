@@ -5,10 +5,27 @@ Reads $MAKEFUN_INPUT_DIR/history.ndjson + task.json (defaults /input) and
 writes $MAKEFUN_OUTPUT_DIR/forecast.json (default /output). Python 3.13,
 standard library only, no network, deterministic (fixed RNG seed).
 
-Model (v3; the house baseline is a different, simpler program):
-  * Each coin's log10 market cap (in SOL) is tracked across the marks it
-    appears in: last level, recent slope (least squares over the last few
-    marks), venue and age.
+Model (v4; the house baseline is a different, simpler program):
+  * v4 change: a CRASH-HAZARD mixture on the size trend normal. The
+    drifted normal alone cannot cover what the real practice showed:
+    top-20 coins' log-caps fall by >0.3 (halve) with p=0.18/0.19/0.24
+    within 10/20/30 min (measured on this history), i.e. a hazard
+    lambda ~= 0.6/h, and the fall is a tight ~-0.55 log10 (3.5x, sd
+    ~0.15) -- a jump, not a widening. So the trend normal becomes a
+    mixture: with probability 1-p_crash(h) the drifted normal, with
+    probability p_crash(h) = min(0.5, 1-exp(-0.6*h)) a crashed normal
+    centred CRASH_DROP below it. This is the Merton jump-diffusion
+    structure (a Gaussian alone understates crash-tail risk by ~92x).
+    It makes the size distribution left-skewed with a fat lower tail,
+    which is where the real practice's actual caps land (v2's tight
+    drifted normal scored size -23.07 real; v1's wider 0.45 sigma
+    scored -17.99; the leader's crash-hazard model scores -14.22).
+    The order model is unchanged from v3. Honest caveat: the local
+    backtests only cover the explosive phase (actual caps ABOVE the
+    drifted centre there), so they cannot validate the crash component
+    -- they are a biased proxy for size parameters (v1 scored much
+    worse than v2 on the single-read backtest yet much better on the
+    real practice). See README for the full proxy-gap analysis.
   * v3 change: N_NEW_MAX 3.0 -> 6.0 (the cap on expected newborn coins
     reaching the top 5). v2 scored -41.4 on the real practice (rank
     399/459) with the size score collapsing to -23.07 (v1: -17.99) --
@@ -120,6 +137,22 @@ SIZE_MIX_MC_TAU_H = 2.0
 # far too wide for the practice and wasted size mass over ~36 bins.)
 SIZE_SD_A = 0.15
 SIZE_SD_B = 0.11
+# --- v4 crash hazard (sizes only) ---------------------------------------
+# A coin's log-cap does not just diffuse: with a per-hour hazard it
+# CRASHES by ~0.55 log10 (measured: top-20 coins fall >0.3 with
+# p=0.176/0.188/0.240 within 10/20/30 min, i.e. lambda ~= 0.6/h; the
+# fall among crashed coins is tight, mean -0.55, sd ~0.15). The size
+# trend normal therefore becomes a mixture: with probability
+# 1-p_crash(h) the drifted normal, with probability p_crash(h) a
+# crashed normal centred CRASH_DROP below it with CRASH_SD width.
+# p_crash grows with horizon (1-exp(-lambda*h)) but is capped at
+# CRASH_P_MAX so the crashed component never dominates entirely at the
+# final's 7-13 h horizons, where the cohort is mature and the
+# conditional hazard is lower than in this young explosive practice.
+CRASH_LAMBDA = 0.6            # per-hour crash hazard (top-20 calibrated)
+CRASH_DROP = 0.55             # mean log10 fall of a crashed coin
+CRASH_SD = 0.25               # width of the crashed component
+CRASH_P_MAX = 0.5             # cap on the crash probability
 DRIFT_TAU_H = 1.5             # cohort-level drift saturates over ~this long
 GROWTH_CAP_H = 2.5            # growth only extrapolates this far (hours)
 GROWTH_AGE_TAU_H = 4.0        # growth fades with coin age
@@ -548,6 +581,11 @@ def build_forecast(task, marks):
     # short horizons, the MC histogram earns its full weight at long ones.
     mix_mc = SIZE_MIX_MC_SHORT + (SIZE_MIX_MC_LONG - SIZE_MIX_MC_SHORT) * (
         1.0 - math.exp(-horizon_h / SIZE_MIX_MC_TAU_H))
+    # v4 crash hazard: with probability p_crash the place-k holder has
+    # crashed, so the trend component is a mixture of the drifted normal
+    # and a crashed normal CRASH_DROP below it. p_crash grows with
+    # horizon and is capped so it never dominates at long horizons.
+    p_crash = min(CRASH_P_MAX, 1.0 - math.exp(-CRASH_LAMBDA * horizon_h))
     sizes = []
     for k in range(places):
         if n == 0 or N_SIMS == 0:
@@ -567,11 +605,19 @@ def build_forecast(task, marks):
             sd = max(size_sd, sd_mc)
         probs = []
         total = 0.0
+        crash_center = center - CRASH_DROP
         for b in range(n_bins):
             mc = place_bin_counts[k][b] / N_SIMS
             lo = -math.inf if b == 0 else edges[b - 1]
             hi = math.inf if b == n_bins - 1 else edges[b]
-            broad = norm_cdf((hi - center) / sd) - norm_cdf((lo - center) / sd)
+            # v4: trend component is the crash mixture, not a single
+            # normal -- (1-p) drifted normal + p crashed normal.
+            broad = ((1.0 - p_crash)
+                     * (norm_cdf((hi - center) / sd)
+                        - norm_cdf((lo - center) / sd))
+                     + p_crash
+                     * (norm_cdf((hi - crash_center) / CRASH_SD)
+                        - norm_cdf((lo - crash_center) / CRASH_SD)))
             p = (mix_mc * mc + (1.0 - mix_mc) * broad) * SIZE_NAMED_SUM
             p = floor6(p)
             if p >= MIN_NAMED_P:

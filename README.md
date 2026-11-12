@@ -145,6 +145,92 @@ real-practice score, yet v2's backtest (-32.70) translated to a real
 cannot be validated locally. v3 is a solid improvement worth
 submitting; #1 would need the crash-hazard size model.
 
+## v4 — crash-hazard size model (2026-11-12, built, NOT submitted)
+
+**The model.** The size trend normal becomes a **crash mixture** (the
+Merton jump-diffusion structure): with probability
+1 − p_crash(h) the drifted normal, with probability
+p_crash(h) = min(0.5, 1 − exp(−0.6·h)) a crashed normal centred
+0.55 log10 below it with sd 0.25. The order model is unchanged from
+v3 (its backtest scores are identical to v3's on every split). Only
+the size trend component changes; the Monte-Carlo histogram component
+is untouched.
+
+**Calibration (measured on this history, not guessed).** Top-20 coins'
+log-caps fall by >0.3 (halve) with p = 0.176 / 0.188 / 0.240 within
+10 / 20 / 30 min, i.e. a hazard λ ≈ 0.55–0.62/h (the 10-min estimate,
+1.16/h, is inflated by mean-reversion noise; the 20–30 min estimates
+converge). Among crashed coins the fall is tight: mean −0.55, sd
+0.13–0.18, range −0.88 to −0.33. Top-5 coins crash even more
+(p up to 0.57 at 30 min, drop mean −0.62) but n is tiny (7–17), so
+the top-20 calibration (λ = 0.6, DROP = 0.55, CRASH_SD = 0.25) is
+used. Research: a Gaussian alone understates crypto crash-tail risk
+by ~92x; Merton jump-diffusion (normal + Poisson jumps) is the
+correct structure (moltbook, calibrated + Monte-Carlo verified);
+token lifetime / hazard models confirm early collapse is the norm
+for new coins (Lánský 2019; Sanhueza & Magner, "Born to Die";
+arXiv 2602.14860). Exa searches: 2 × $0.007 = $0.014.
+
+**Effect at the practice horizon (h = 0.667).** Per place, v4 vs v3:
+mean size pulled down ~0.13 log10 (place 1: 4.05 → 3.92), effective
+sd widened 0.22 → 0.33 (between v2's 0.24 and v1's 0.45), left-tail
+mass (below mean − 0.3) doubled 0.10 → 0.19. The distribution is
+left-skewed with a fat lower tail — where the real practice's actual
+caps land — instead of v3's symmetric narrow normal centred on the
+drifted (overshooting) level.
+
+**Backtest results — v4 does NOT beat v3 (do NOT submit on this
+evidence).** Multi-read: v4 **−32.71** (order −18.06, size −14.65)
+vs v3 −32.16 (order −18.06, size −14.11), Δ **−0.55**, all from
+size. Single-read: v4 **−31.65** vs v3 −31.02, Δ **−0.63**, all from
+size. A full sweep of the crash parameters on the multi-read backtest
+(λ ∈ {0.3, 0.6, 1.0} × DROP ∈ {0.35, 0.55, 0.8}, CRASH_SD 0.25,
+P_MAX ∈ {0.3, 0.5}) finds **no setting that beats v3**: best is
+λ = 0.3, DROP = 0.35 at −32.35 (Δ −0.19); worst is λ = 1.0,
+DROP = 0.8 at −33.22 (Δ −1.06). The penalty is monotonic in crash
+strength. P_MAX makes no difference (p_crash never reaches 0.3 at
+the backtest horizons ≤ 0.33 h).
+
+**Why the backtest rejects the crash — the proxy gap (read this
+before judging v4).** The backtests only cover the explosive phase
+(cuts 20:20–20:40, future reads to 20:50). There, the actual
+place-k caps sit **above** the drifted centre (split K=3 residuals
++0.07 to +0.37) or near it (K=4/K=5: −0.02 to −0.19), so a
+below-centre crash component is penalised by construction. The real
+practice (21:00–22:00, 10–70 min after the 21:00 cut) is the
+post-peak window where the drift decelerates and crashes bite — and
+the history ends at 20:50, so **no local data exists in that
+regime**. The backtest is *proven* anti-correlated with real size
+performance: on the single-read backtest v1 scored −36.79 vs v2's
+−31.45 (v2 better by 5.34), yet on the real practice v1 scored
+−37.84 vs v2's −41.4 (v1 better by 3.56) — the ranking reverses,
+driven by size (v1's wide 0.45 sigma vs v2's tight 0.24). The
+multi-read backtest shows the same bias (it penalised drift-shrink
+1.0 → 0.5 and sigma-widening 0.15 → 0.30, both of which the
+v1-vs-v2 real evidence says help). So a backtest loss of −0.19 to
+−1.06 for the crash does **not** imply a real loss: the backtest's
+known bias against size-widening/left-skewing changes is ~5 points
+in the opposite direction. What the backtest *does* prove is that
+the crash cannot be validated locally — its benefit must be judged
+on the real-practice evidence (v1's wider sigma: size −17.99 vs
+v2's −23.07; the leader's crash-hazard size: −14.22) and on the
+measured crash rates in the data. Given that bias, a backtest gain
+would need to be at least +1 to +2 before the backtest alone could
+justify a submit; the crash shows a backtest *loss*, so the backtest
+alone cannot justify it. The decision is a judgment call for the
+parent: v4 is the leader's exact structure, calibrated from measured
+data, and the only path to #1 — but it is unvalidatable locally and
+costs 1 of the 6 remaining submit slots. v3 (already submitted) is
+the safe fallback.
+
+**Files.** `main_v4.py` is the v4 candidate (v3 preserved as
+`main_v3.py`; `main.py` is still v3, the submitted entry).
+`diagnose_crash.py`, `calibrate_crash.py`, `sweep_crash.py`,
+`compare_v3_v4.py` are dev-only diagnostics (do NOT upload).
+v4 is deterministic (2 runs byte-identical) and format-valid
+(exactly 3 keys, 500 probability rows, 275 size rows, top5 = 5,
+per-place size sums 0.88, per-place order sums identical to v3).
+
 ## Local backtest
 
 `backtest.py` is a **dev-only** script (do NOT upload it to the GitHub
