@@ -5,49 +5,38 @@ Reads $MAKEFUN_INPUT_DIR/history.ndjson + task.json (defaults /input) and
 writes $MAKEFUN_OUTPUT_DIR/forecast.json (default /output). Python 3.13,
 standard library only, no network, deterministic (fixed RNG seed).
 
-Model (hybrid: v2 order + v1 size; the house baseline is a different,
-    simpler program):
-  * Each coin's log10 market cap (in SOL) is tracked across the marks it
-    appears in: last level, recent slope (least squares over the last few
-    marks), venue and age.
-  * The median log-cap at the mid answer-read horizon is predicted as a
-    damped extrapolation of the recent slope (growth fades with coin age
-    and is capped at ~2.5 h of horizon) pulled toward a venue-specific
-    long-run level with an ~8 h mean-reversion time (v1). The slope is
-    shrunk by a fixed 0.5 (v1): slopes do not persist. Curve coins take
-    a haircut
-    (pool pricing after graduation is usually below the curve's virtual
-    price); a curve coin close to graduation (>= 55 SOL in quote
-    reserves) is treated as a likely graduate landing near 2.3-2.8.
-  * Uncertainty grows with horizon, but the random-walk term saturates
-    (effective horizon capped at ~4 h): a coin's log-cap does not wander
-    without bound, it peaks and decays. Without the saturation the
-    Monte-Carlo tail invents 10^6 SOL caps at long horizons.
-  * Place probabilities come from a seeded Monte-Carlo over the top
-    candidates' lognormal caps, with newborn coins drawn INSIDE each
-    sim (Poisson count from the measured entry rate, caps near the
-    cohort's place-3 level). A newcomer must beat the cap a named coin
-    actually draws, not its reverted mean. A sim where a newcomer holds
-    a place leaves that place's mass unnamed, so each place's unnamed
-    share is whatever the newcomer model leaves (in the practice, 3 of
-    the top 5 at the last read were not nameable from the history).
-    The fixed 0.50 unnamed share of v1 is gone.
-  * Chart fillers: each place is filled to the 100-row cap with the
-    coins most likely to be on the answer chart but near-certain not to
-    hold the place, at p = 1e-6. The scorer shares a place's unnamed
-    mass over the chart's coins NOT named at that place, so naming them
-    shrinks the denominator and leaves the unnamed share to the
-    newcomers who may take the place.
-  * Size distributions per place mix the Monte-Carlo order-statistic
-    histogram with a trend normal centred on the cohort level — the
-    place-k cap at the cut, pulled up toward the place-1 cap and drifted
-    by the recent place-1 drift (half-trusted, v1: drift * 0.5, capped
-    at 0.6). The trend normal is fixed: sd 0.45, MC weight 0.40 (v1).
-    ~12% of each place's
-    size mass is left unnamed, so a missed bin costs far less than the
-    -9.21 floor.
-  * top5 is ranked by total Monte-Carlo top-5 probability (after the
-    newcomers), tie-broken by predicted median.
+Model (v5 -- the per-coin Monte-Carlo size engine from rank1-trace.md):
+  * The cohort-level trend normal for sizes is GONE. Each candidate
+    coin is simulated on its OWN trajectory to each of the 7 answer
+    reads: an Ornstein-Uhlenbeck log-cap process with a per-coin
+    momentum drift (own shrunk slope blended 50/50 with the cohort
+    drift, active only in the first 2.5 h, faded by coin age), cohort
+    vol 0.30/h (per-coin residual vols are noise-dominated on a
+    <=6-mark history and are deliberately NOT used), mean reversion
+    toward a venue-specific level (tau 12 h), and Merton crash jumps
+    (lambda 0.30/h, drop ~N(0.55, 0.15)). At each simulated read the
+    top-5 caps are taken, so the place-k size distribution is the
+    distribution of the simulated place-k cap and the order
+    probabilities come from the SAME paths -- order and size are
+    JOINT, which is the structure the rank-1 trace says wins
+    (leader centre error d ~0-0.16 dex vs our v1 d ~0.44).
+  * Newcomers (coins born after the cut) are drawn INSIDE each sim at
+    each read (Poisson from the measured entry rate, caps near the
+    cohort's place-3 level), as in v2-v4.
+  * Sizes = the MC order-statistic histogram per place, smoothed
+    with a broad normal (weight 0.25, sd >= 0.30) so unhit bins keep
+    some mass; 12% of each place's size mass stays unnamed.
+  * Kept from v4: candidate ranking by predict_coin median (used
+    only to select the 80 simulated candidates and for fillers /
+    top5 tie-breaks), chart fillers at p=1e-6, top5 by total MC
+    top-5 probability, curve haircut / near-graduation level.
+  * Deliberately NOT in v5 (see v5-notes.md): no per-coin vol
+    estimation, no per-read separate forecasts (the entry format is
+    one forecast scored at all 7 reads), no sweep of the 50/50
+    slope blend or crash lambda -- those are the backtest worker's
+    job. N_SIMS is 3000 (not 15000): 7 reads x 3000 sims x ~80 coins
+    x up to ~13 hourly steps is the pure-Python budget for a
+    ~1-2 minute run.
 """
 
 import bisect
@@ -61,8 +50,8 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------- constants
 
 SEED = 20261112
-N_SIMS = 15000
-N_CANDIDATES = 150
+N_SIMS = 3000
+N_CANDIDATES = 80
 # Newcomer displacement: coins born after the history cut take some
 # top-5 places, pushing every named coin down by the number of newcomers
 # that moon above it. The expected number in the top 5 is estimated
@@ -73,23 +62,48 @@ N_CANDIDATES = 150
 # A newcomer's cap is ~Normal(NEW_CAP_CENTER, NEW_CAP_SD), centred on
 # the cohort's place-3 level: in the practice the newborn top-5 coins
 # landed at 3.10-3.47 while place 1 sat at 3.56.
-N_NEW_MAX = 3.0
+N_NEW_MAX = 6.0  # v3: raised from 3.0 (see sweep notes below).
+# v3 note: the entry rate is hundreds/hour, so lam = 0.20*rate*h is large
+# and this cap binds hard. v2's 3.0 underestimated how many fresh coins
+# displace the named leaders, especially on later reads where composition
+# churns. Multi-read backtest: 3.0 -> -32.70, 4.0 -> -32.38, 5.0 -> -32.18,
+# 6.0 -> -32.16 (best), 8.0 -> -32.25 (order degrades past the optimum).
+# The real practice horizon (mid 0.667h, reads to 1.17h) is longer than
+# the backtest's max 0.5h, so the cap binds even harder there -- 6.0 is
+# the safer side of the optimum for the real grading window.
 N_NEW_H_SAT = 2.0           # horizon beyond this adds no more newcomers
 NEW_CAP_SD = 0.25
 FILLER_P = 0.000001         # p for chart-filler rows (see below)
 SIZE_NAMED_SUM = 0.88         # share of each place's size mass named
-# Size model is v1's, fixed (not horizon-adaptive): the trend normal
-# has sd 0.45 and the Monte-Carlo histogram has weight 0.40. v2's
-# adaptive sigma (0.15 + 0.11*sqrt(h)) and adaptive mix (0.20 -> 0.40)
-# were far too tight at practice horizons and collapsed the size score
-# on the real practice (v2 size -23.07 vs v1 -17.99).
-SIZE_MIX_MC = 0.4             # weight of the Monte-Carlo histogram in sizes
-SIZE_MIX_SD = 0.45            # sd of the trend normal mixed into sizes
+# --- v5 per-coin trajectory constants ----------------------------------
+# V5_SIGMA_H: cohort vol per hour. Measured: 10-min log-cap change sd
+# 0.121 -> 0.121*sqrt(6) = 0.296/h. Per-coin residual vols are NOT used
+# (median ~0.003 on this history -- coins print flat between marks).
+V5_SIGMA_H = 0.30
+# V5 crash jumps (Merton): hazard 0.30/h, drop ~N(0.55, 0.15). v4's
+# top-20 hazard was 0.6/h on the young explosive cohort; 0.30/h sits
+# between that and the all-coins >0.3-drop rate (~15%/h implied).
+V5_CRASH_LAMBDA = 0.30
+V5_CRASH_DROP = 0.55
+V5_CRASH_DROP_SD = 0.15
+# Weight of the broad-normal smoothing in sizes (rest = MC histogram).
+SIZE_SMOOTH_W = 0.25
+# Cap on the cohort drift's contribution to a coin's momentum (log10/h).
+V5_G_CAP = 0.30
+# Long-run level newborn top-5 coins revert toward (log10 cap in SOL).
+V5_NEW_LEVEL = 2.6
 DRIFT_TAU_H = 1.5             # cohort-level drift saturates over ~this long
 GROWTH_CAP_H = 2.5            # growth only extrapolates this far (hours)
 GROWTH_AGE_TAU_H = 4.0        # growth fades with coin age
-# Slope shrink is v1's fixed 0.5: slopes do not persist.
-REVERT_TAU_H = 8.0             # mean-reversion time (hours, v1)
+# Slope shrink is horizon-dependent: at a short horizon the last level
+# pins the answer and the estimated slope is mostly noise (the backtests
+# prefer ~0.25 there), while at a long horizon the slope is the growth
+# signal that separates coins still climbing from coins about to die,
+# so it earns a larger weight (~0.55 at the final's ~10 h).
+SLOPE_SHRINK_SHORT = 0.25
+SLOPE_SHRINK_LONG = 0.55
+SLOPE_SHRINK_TAU_H = 3.0
+REVERT_TAU_H = 12.0            # mean-reversion time (hours)
 # The per-coin sigma's random-walk term saturates: a coin's log-cap does
 # not random-walk without bound (it peaks and decays), so the horizon
 # entering sigma2 is capped at SIGMA_TAU_H of effective hours. At the
@@ -231,7 +245,9 @@ def predict_coin(obs, cut_epoch, horizon_h):
     age_h = max(0.0, (cut_epoch - created) / 3600.0) if created else 24.0
 
     slope = fit_slope(obs)
-    slope = max(-1.0, min(1.5, slope)) * 0.5  # shrink: slopes do not persist (v1 fixed)
+    shrink = SLOPE_SHRINK_SHORT + (SLOPE_SHRINK_LONG - SLOPE_SHRINK_SHORT) * (
+        1.0 - math.exp(-horizon_h / SLOPE_SHRINK_TAU_H))
+    slope = max(-1.0, min(1.5, slope)) * shrink
     growth = slope * min(horizon_h, GROWTH_CAP_H) * math.exp(-age_h / GROWTH_AGE_TAU_H)
 
     level = LONG_RUN.get(venue, 1.7)
@@ -313,7 +329,7 @@ def build_forecast(task, marks):
                       for i in range(max(0, len(p1_series) - 4), len(p1_series) - 1))
         cadence = float(task.get("cadence_minutes") or 10)
         drift_per_hour = incs[len(incs) // 2] * (60.0 / cadence)
-        g = max(0.0, min(0.6, drift_per_hour * 0.5))  # v1: half-trust the drift
+        g = max(0.0, min(1.2, drift_per_hour * 1.0))  # trust the measured cohort drift
     else:
         g = 0.3
     h_drift = DRIFT_TAU_H * (1.0 - math.exp(-horizon_h / DRIFT_TAU_H))
@@ -326,6 +342,7 @@ def build_forecast(task, marks):
     # entries, is what a snapshot sees), capped at N_NEW_MAX. A newborn
     # top-5 coin lands near the cohort's place-3 level.
     n_new = 0.0
+    new_rate = 0.0
     mark_times = [parse_iso(m.get("at")) for m in marks]
     mark_times = [t for t in mark_times if t is not None]
     first_seen = {}
@@ -353,6 +370,7 @@ def build_forecast(task, marks):
             span_h = (win_times[-1] - win_times[0]) / 3600.0
             if span_h > 0 and entrants > 0:
                 rate = entrants / span_h
+                new_rate = rate
                 n_new = min(N_NEW_MAX,
                             rate * min(horizon_h, N_NEW_H_SAT))
     if last_caps:
@@ -361,25 +379,135 @@ def build_forecast(task, marks):
     else:
         new_cap_center = 3.0
 
-    # --- seeded Monte-Carlo over the candidates' log-caps ----------------
-    # Each coin's simulated cap is capped at mu + 2 sigma: a lognormal tail
-    # would otherwise let any of ~150 mediocre coins draw +2.7 sigma and
-    # claim the top places with a 500x moonshot no real coin makes, which
-    # inflates the top places' sizes into absurd bins (a 10^6 SOL cap).
-    # The cap barely touches ranking among the plausible leaders.
+    # --- v5: per-coin Monte-Carlo trajectories ---------------------------
+    # The size model is now the simulation itself, not a cohort-level
+    # trend normal. Each candidate coin gets its OWN trajectory to the
+    # answer reads: log-cap y(t) follows an Ornstein-Uhlenbeck process
+    # with a per-coin momentum drift, per-coin vol, and Merton crash
+    # jumps. At each simulated read the top-5 caps are taken, so the
+    # place-k size distribution is the distribution of the simulated
+    # place-k cap and the order probabilities come from the SAME paths
+    # (joint order+size -- a coin that moons becomes #1 AND pushes the
+    # #1 cap up, which the split v1-v4 model could not express).
     #
-    # Newcomers are drawn INSIDE the Monte-Carlo: each sim draws
-    # Poisson(n_new) newborn coins with caps ~ Normal(new_cap_center,
-    # NEW_CAP_SD) and ranks them against the named coins' DRAWN caps.
-    # That is the honest comparison: a newcomer must beat the cap a named
-    # coin actually draws (the upper tail that survives into the top 5),
-    # not its mean-reverted mu. A sim where a newcomer holds a place
-    # leaves that place's mass unnamed, so each place's unnamed share is
-    # whatever the newcomer model leaves -- no fixed share. This replaces
-    # the earlier Poisson-displacement convolution, which compared
-    # newcomers against mus and therefore overstated their dominance at
-    # long horizons, where the named coins' mus have reverted down while
-    # their drawn top caps have not.
+    # Per step (dt hours, capped at 1 h per step):
+    #   y += mom * dt_mom            (own momentum, first 2.5 h only)
+    #   y += theta * (level - y) * dt (mean reversion, tau = 12 h)
+    #   y += sigma * sqrt(dt) * Z     (diffusion)
+    #   y -= Jump  with prob 1-exp(-lambda*dt)  (crash, ~N(0.55, 0.15))
+    # mom = 0.75 * shrunk_own_slope * age_fade + 0.25 * cohort_drift g.
+    # The own slope comes from the last <=4 marks (fit_slope); it is
+    # shrunk (0.25 short horizon -> 0.55 long) because 10-min slopes
+    # are mostly noise. The cohort drift enters only at weight 0.25
+    # and capped at 0.30/h: the raw place-1 drift (0.9/h in this
+    # explosive practice) is driven by a few hot coins, not the median
+    # coin, and the practice evidence is that the cohort DECELERATES
+    # (v1's centres, drifted up by the full g, landed 0.44 dex above
+    # the realised caps). Giving every coin the full g as a rising
+    # tide was the first version's bug: it put the place-1 size mean
+    # at 4.13. The 75/25 blend and the 0.30 cap are priors, not
+    # measurements; the backtest worker should sweep them.
+    # sigma: cohort vol 0.30/h (measured: 10-min change sd 0.121 ->
+    # 0.121*sqrt(6) = 0.296/h). Per-coin residual vols are NOT used:
+    # on this history their median is ~0.003 (coins print flat between
+    # marks), so they are noise-dominated and would understate vol.
+    # Single-observation coins get extra vol (sqrt-add 0.10), curve
+    # coins extra vol (sqrt-add 0.15, graduation uncertainty).
+    # Crash hazard lambda = 0.30/h with drop ~N(0.55, 0.15): v4's
+    # top-20 hazard was 0.6/h, but that was the young explosive
+    # cohort; 0.30/h is the all-coins >0.3-drop rate implied by the
+    # history (2.8% per 10 min -> ~15%/h for a >0.3 fall, and the
+    # crash drop is larger than 0.3, so the hazard for a full 0.55
+    # drop is lower -- 0.30/h sits between the two measurements).
+    # With OU reversion the crashes create the left tail and the
+    # dispersion without collapsing every coin: a crashed coin is
+    # pulled back UP toward its level, a mooning coin pulled DOWN.
+    #
+    # Newcomers are drawn INSIDE each sim at each read (Poisson(n_new)
+    # with the v4 rate model, caps ~ Normal(new_cap_center, 0.25)),
+    # exactly as in v2-v4, so a newcomer must beat the cap a named
+    # coin actually draws at that read.
+    sim_y0 = []
+    sim_level = []
+    sim_mom = []
+    sim_sig = []
+    shrink = SLOPE_SHRINK_SHORT + (SLOPE_SHRINK_LONG - SLOPE_SHRINK_SHORT) * (
+        1.0 - math.exp(-horizon_h / SLOPE_SHRINK_TAU_H))
+    for mint in c_mints:
+        obs = series[mint]
+        last = obs[-1]
+        y0 = last[1]
+        venue = last[2]
+        created = last[5]
+        age_h = max(0.0, (cut_epoch - created) / 3600.0) if created else 24.0
+        slope = fit_slope(obs)
+        slope = max(-1.0, min(1.5, slope)) * shrink
+        slope *= math.exp(-age_h / GROWTH_AGE_TAU_H)
+        mom = 0.75 * slope + 0.25 * min(g, V5_G_CAP)
+        mom = max(-0.5, min(1.5, mom))
+        level = LONG_RUN.get(venue, 1.7)
+        if venue == "curve":
+            y0 = y0 - CURVE_HAIRCUT
+            qsol = last[4]
+            if qsol is not None and qsol >= CURVE_GRAD_QUOTE_SOL:
+                level = 2.1  # likely graduate landing level, not 1.7
+        sig2 = V5_SIGMA_H ** 2
+        if len(obs) == 1:
+            sig2 += 0.10 ** 2
+        if venue == "curve":
+            sig2 += 0.15 ** 2
+        sim_y0.append(y0)
+        sim_level.append(level)
+        sim_mom.append(mom)
+        sim_sig.append(math.sqrt(sig2))
+
+    # Time grid: step from the cut to each read in <=1 h steps; record
+    # the top 5 at every read. Reads at/before the cut are recorded
+    # from the starting caps (no steps). The forecast is ONE set of
+    # probabilities scored at all 7 reads, so counts accumulate over
+    # (sim, read) pairs: total_draws = N_SIMS * n_reads.
+    read_epochs = sorted(reads) if reads else [cut_epoch + 3600.0]
+    steps = []  # (dt_hours, read_index_or_None)
+    t_cursor = cut_epoch
+    for j, r_epoch in enumerate(read_epochs):
+        if r_epoch <= t_cursor:
+            # Read at/before the cut: record from the starting caps.
+            steps.append((0.0, j))
+            continue
+        while r_epoch - t_cursor > 3600.0 + 1e-9:
+            steps.append((1.0, None))
+            t_cursor += 3600.0
+        dt = max(0.0, (r_epoch - t_cursor) / 3600.0)
+        steps.append((dt, j))
+        t_cursor = r_epoch
+    n_reads = len(read_epochs)
+    total_draws = N_SIMS * n_reads
+
+    # Per-read newcomer parameters (v4 rate model, per-read horizon).
+    # Centre: newborn top-5 coins land near the cohort's place-3 level
+    # AT THE CUT (measured in the practice: newborns landed 3.10-3.47
+    # while place 1 sat at 3.56) and revert toward the cohort level
+    # V5_NEW_LEVEL with horizon -- they are NOT drifted up by the
+    # explosive-phase place-1 drift g. The old centre (place-3 +
+    # g*h_drift, = 4.04 here) was the same error as v1's size centre:
+    # with n_new saturating at the 6.0 cap, ~6 newcomers per sim at
+    # ~N(4.04, 0.25) swamped every named coin and pushed the place-1
+    # size mean to 4.10. The rate itself (18/h here, capped at 6.0)
+    # is inherited from v2-v4 untouched; only the centre is fixed.
+    new_per_read = []
+    if last_caps:
+        new_base = max(last_caps[min(2, len(last_caps) - 1)],
+                       last_caps[0] - 0.20)
+    else:
+        new_base = 3.0
+    for r_epoch in read_epochs:
+        h_j = max(0.0, (r_epoch - cut_epoch) / 3600.0)
+        n_new_j = min(N_NEW_MAX,
+                      new_rate * min(h_j, N_NEW_H_SAT)) if new_rate > 0 else 0.0
+        center_j = V5_NEW_LEVEL + (new_base - V5_NEW_LEVEL) * math.exp(
+            -h_j / REVERT_TAU_H)
+        new_per_read.append((n_new_j, center_j))
+
     place_counts = [[0] * n for _ in range(places)]
     place_bin_counts = [[0] * n_bins for _ in range(places)]
     place_sum = [0.0] * places
@@ -387,38 +515,56 @@ def build_forecast(task, marks):
     if n:
         rng = random.Random(SEED)
         gauss = rng.gauss
-        caps = [mu + 2.0 * sg for mu, sg in zip(c_mus, c_sigs)]
-        new_cap = new_cap_center + 2.0 * NEW_CAP_SD
+        rand = rng.random
+        lam = V5_CRASH_LAMBDA
+        theta = 1.0 / REVERT_TAU_H
         for _ in range(N_SIMS):
-            vals = [min(gauss(mu, sg), cap)
-                    for mu, sg, cap in zip(c_mus, c_sigs, caps)]
-            if n_new > 0:
-                # Poisson(n_new) by Knuth's algorithm (n_new <= 3).
-                thresh = math.exp(-n_new)
-                prod = 1.0
-                while True:
-                    prod *= rng.random()
-                    if prod <= thresh:
-                        break
-                    vals.append(min(gauss(new_cap_center, NEW_CAP_SD),
-                                    new_cap))
-            order = sorted(range(len(vals)), key=vals.__getitem__,
-                           reverse=True)[:places]
-            for k, idx in enumerate(order):
-                v = vals[idx]
-                place_sum[k] += v
-                place_sumsq[k] += v * v
-                place_bin_counts[k][bin_of(v, edges)] += 1
-                if idx < n:
-                    place_counts[k][idx] += 1
-                # A newcomer holding the place leaves its mass unnamed:
-                # place k's unnamed share is 1 minus its named sum.
+            y = list(sim_y0)
+            elapsed = 0.0
+            for dt, j in steps:
+                if dt > 0:
+                    # Momentum only in the first GROWTH_CAP_H hours.
+                    dt_mom = max(0.0, min(dt, GROWTH_CAP_H - elapsed))
+                    for i in range(n):
+                        dy = sim_mom[i] * dt_mom
+                        dy += theta * (sim_level[i] - y[i]) * dt
+                        dy += sim_sig[i] * math.sqrt(dt) * gauss(0.0, 1.0)
+                        if rand() < 1.0 - math.exp(-lam * dt):
+                            drop = gauss(V5_CRASH_DROP, V5_CRASH_DROP_SD)
+                            dy -= drop if drop > 0.05 else 0.05
+                        y[i] += dy
+                    elapsed += dt
+                if j is not None:
+                    n_new_j, center_j = new_per_read[j]
+                    vals = list(y)
+                    if n_new_j > 0:
+                        # Poisson(n_new_j) by Knuth's algorithm.
+                        thresh = math.exp(-n_new_j)
+                        prod = 1.0
+                        while True:
+                            prod *= rand()
+                            if prod <= thresh:
+                                break
+                            vals.append(gauss(center_j, NEW_CAP_SD))
+                    order = sorted(range(len(vals)), key=vals.__getitem__,
+                                   reverse=True)[:places]
+                    for k, idx in enumerate(order):
+                        v = vals[idx]
+                        place_sum[k] += v
+                        place_sumsq[k] += v * v
+                        place_bin_counts[k][bin_of(v, edges)] += 1
+                        if idx < n:
+                            place_counts[k][idx] += 1
+                        # A newcomer holding the place leaves its mass
+                        # unnamed: place k's unnamed share is 1 minus
+                        # its named sum.
 
-    # Place probabilities are the Monte-Carlo frequencies directly: the
-    # newcomers are already inside the sims, so a named coin's frequency
-    # at a place is its honest probability of holding it, and 1 minus a
-    # place's named sum is its newcomer share.
-    place_probs = [[place_counts[k][idx] / N_SIMS for k in range(places)]
+    # Place probabilities are the Monte-Carlo frequencies directly,
+    # averaged over sims AND reads: the newcomers are already inside
+    # the sims, so a named coin's frequency at a place is its honest
+    # probability of holding it, and 1 minus a place's named sum is
+    # its newcomer share.
+    place_probs = [[place_counts[k][idx] / total_draws for k in range(places)]
                    for idx in range(n)]
 
     probabilities = []
@@ -487,43 +633,34 @@ def build_forecast(task, marks):
             for mint, place, p in rows
         )
 
-    # --- sizes -------------------------------------------------------------
-    # Two components. (a) The Monte-Carlo order-statistic histogram of the
-    # surviving history coins. (b) A trend normal centred on the cohort
-    # level: the place-k cap at the cut, pulled up toward the place-1 cap
-    # (the top 5 compress together as a cohort matures: at the last
-    # practice mark places 1-5 sat within 0.28 log of each other) and
-    # drifted up by the recent place-1 drift, saturating over ~1.5 h.
-    # Component (b) is what covers coins born after the cut, which the
-    # Monte-Carlo cannot see and which take most top-5 places at long
-    # horizons; without it the sizes sit far too low. (last_caps, g and
-    # h_drift were computed above, before the Monte-Carlo.)
-    # Size model is v1's, fixed: trend normal sd 0.45, MC mix 0.40.
+    # --- sizes (v5): the Monte-Carlo order-statistic histogram -----------
+    # The size distribution per place IS the simulated distribution of
+    # the place-k cap across (sim, read) paths -- no cohort-level trend
+    # normal any more. The histogram is smoothed with a broad normal
+    # (weight SIZE_SMOOTH_W) centred on the MC mean with sd at least
+    # 0.30, so a bin the simulation never hit still gets some mass
+    # instead of leaving the truth to the unnamed share alone, and so
+    # neighbouring bins share mass when the MC histogram is spiky.
+    # ~12% of each place's size mass is left unnamed, so a missed bin
+    # costs far less than the -9.21 floor.
     sizes = []
     for k in range(places):
-        if n == 0 or N_SIMS == 0:
+        if n == 0 or total_draws == 0:
             continue
-        mean = place_sum[k] / N_SIMS
-        var = max(0.0, place_sumsq[k] / N_SIMS - mean * mean)
+        mean = place_sum[k] / total_draws
+        var = max(0.0, place_sumsq[k] / total_draws - mean * mean)
         sd_mc = math.sqrt(var)
-        if last_caps and len(last_caps) >= k + 1:
-            cap_k = last_caps[k]
-            cap_1 = last_caps[0]
-            center = max(cap_k, cap_1 - 0.10 * k) + g * h_drift
-            center = min(center, cap_1 + 0.8)
-            center = max(center, cap_k)
-            sd = SIZE_MIX_SD
-        else:
-            center = mean
-            sd = max(SIZE_MIX_SD, sd_mc)
+        sd_broad = max(0.30, sd_mc)
         probs = []
         total = 0.0
         for b in range(n_bins):
-            mc = place_bin_counts[k][b] / N_SIMS
+            mc = place_bin_counts[k][b] / total_draws
             lo = -math.inf if b == 0 else edges[b - 1]
             hi = math.inf if b == n_bins - 1 else edges[b]
-            broad = norm_cdf((hi - center) / sd) - norm_cdf((lo - center) / sd)
-            p = (SIZE_MIX_MC * mc + (1.0 - SIZE_MIX_MC) * broad) * SIZE_NAMED_SUM
+            broad = (norm_cdf((hi - mean) / sd_broad)
+                     - norm_cdf((lo - mean) / sd_broad))
+            p = ((1.0 - SIZE_SMOOTH_W) * mc + SIZE_SMOOTH_W * broad) \
+                * SIZE_NAMED_SUM
             p = floor6(p)
             if p >= MIN_NAMED_P:
                 probs.append((b, p))
