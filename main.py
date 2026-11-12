@@ -5,52 +5,17 @@ Reads $MAKEFUN_INPUT_DIR/history.ndjson + task.json (defaults /input) and
 writes $MAKEFUN_OUTPUT_DIR/forecast.json (default /output). Python 3.13,
 standard library only, no network, deterministic (fixed RNG seed).
 
-Model (v4; the house baseline is a different, simpler program):
-  * v4 change: a CRASH-HAZARD mixture on the size trend normal. The
-    drifted normal alone cannot cover what the real practice showed:
-    top-20 coins' log-caps fall by >0.3 (halve) with p=0.18/0.19/0.24
-    within 10/20/30 min (measured on this history), i.e. a hazard
-    lambda ~= 0.6/h, and the fall is a tight ~-0.55 log10 (3.5x, sd
-    ~0.15) -- a jump, not a widening. So the trend normal becomes a
-    mixture: with probability 1-p_crash(h) the drifted normal, with
-    probability p_crash(h) = min(0.5, 1-exp(-0.6*h)) a crashed normal
-    centred CRASH_DROP below it. This is the Merton jump-diffusion
-    structure (a Gaussian alone understates crash-tail risk by ~92x).
-    It makes the size distribution left-skewed with a fat lower tail,
-    which is where the real practice's actual caps land (v2's tight
-    drifted normal scored size -23.07 real; v1's wider 0.45 sigma
-    scored -17.99; the leader's crash-hazard model scores -14.22).
-    The order model is unchanged from v3. Honest caveat: the local
-    backtests only cover the explosive phase (actual caps ABOVE the
-    drifted centre there), so they cannot validate the crash component
-    -- they are a biased proxy for size parameters (v1 scored much
-    worse than v2 on the single-read backtest yet much better on the
-    real practice). See README for the full proxy-gap analysis.
-  * v3 change: N_NEW_MAX 3.0 -> 6.0 (the cap on expected newborn coins
-    reaching the top 5). v2 scored -41.4 on the real practice (rank
-    399/459) with the size score collapsing to -23.07 (v1: -17.99) --
-    the entry rate is hundreds/hour, so the newcomer count lam is large
-    and the cap binds hard; v2 underestimated the displacement of named
-    leaders by fresh coins on the later reads. Multi-read backtest
-    (scores a forecast against ALL future marks, not one): v2 -32.70,
-    v3 -32.16 (+0.54). Rejected by the same backtest: drift-shrink
-    1.0 -> 0.5 and size-sigma widening (both worse on the backtest, even
-    though v1's wider size scored better on the real practice -- the
-    local backtests only cover the explosive phase and cannot reproduce
-    the real practice's drift deceleration, so they are a biased proxy
-    for size parameters; the newcomer cap is the one lever that improves
-    both the backtest and, by the v1-vs-v2 leaderboard evidence, the
-    real practice).
+Model (hybrid: v2 order + v1 size; the house baseline is a different,
+    simpler program):
   * Each coin's log10 market cap (in SOL) is tracked across the marks it
     appears in: last level, recent slope (least squares over the last few
     marks), venue and age.
   * The median log-cap at the mid answer-read horizon is predicted as a
     damped extrapolation of the recent slope (growth fades with coin age
     and is capped at ~2.5 h of horizon) pulled toward a venue-specific
-    long-run level with a ~12 h mean-reversion time. The slope shrink is
-    horizon-dependent (~0.25 at short horizons, where the last level pins
-    the answer and the slope is mostly noise, ~0.55 at the final's ~10 h,
-    where the slope is the growth signal). Curve coins take a haircut
+    long-run level with an ~8 h mean-reversion time (v1). The slope is
+    shrunk by a fixed 0.5 (v1): slopes do not persist. Curve coins take
+    a haircut
     (pool pricing after graduation is usually below the curve's virtual
     price); a curve coin close to graduation (>= 55 SOL in quote
     reserves) is treated as a likely graduate landing near 2.3-2.8.
@@ -76,10 +41,9 @@ Model (v4; the house baseline is a different, simpler program):
   * Size distributions per place mix the Monte-Carlo order-statistic
     histogram with a trend normal centred on the cohort level — the
     place-k cap at the cut, pulled up toward the place-1 cap and drifted
-    by the recent place-1 drift (trusted fully: the cohort's measured
-    drift). The trend normal's sd and the MC mix weight are both
-    horizon-adaptive: tight at short horizons (sd ~0.15, MC weight 0.20),
-    wide at long ones (sd ~0.50, MC weight 0.40). ~12% of each place's
+    by the recent place-1 drift (half-trusted, v1: drift * 0.5, capped
+    at 0.6). The trend normal is fixed: sd 0.45, MC weight 0.40 (v1).
+    ~12% of each place's
     size mass is left unnamed, so a missed bin costs far less than the
     -9.21 floor.
   * top5 is ranked by total Monte-Carlo top-5 probability (after the
@@ -109,62 +73,23 @@ N_CANDIDATES = 150
 # A newcomer's cap is ~Normal(NEW_CAP_CENTER, NEW_CAP_SD), centred on
 # the cohort's place-3 level: in the practice the newborn top-5 coins
 # landed at 3.10-3.47 while place 1 sat at 3.56.
-N_NEW_MAX = 6.0  # v3: raised from 3.0 (see sweep notes below).
-# v3 note: the entry rate is hundreds/hour, so lam = 0.20*rate*h is large
-# and this cap binds hard. v2's 3.0 underestimated how many fresh coins
-# displace the named leaders, especially on later reads where composition
-# churns. Multi-read backtest: 3.0 -> -32.70, 4.0 -> -32.38, 5.0 -> -32.18,
-# 6.0 -> -32.16 (best), 8.0 -> -32.25 (order degrades past the optimum).
-# The real practice horizon (mid 0.667h, reads to 1.17h) is longer than
-# the backtest's max 0.5h, so the cap binds even harder there -- 6.0 is
-# the safer side of the optimum for the real grading window.
+N_NEW_MAX = 3.0
 N_NEW_H_SAT = 2.0           # horizon beyond this adds no more newcomers
 NEW_CAP_SD = 0.25
 FILLER_P = 0.000001         # p for chart-filler rows (see below)
 SIZE_NAMED_SUM = 0.88         # share of each place's size mass named
-# Weight of the Monte-Carlo histogram in sizes. At a short horizon the
-# cohort level pins the place-k cap, so the tight trend normal should
-# dominate (mix ~0.20); at a long horizon the MC histogram's honest
-# which-coin spread earns its full 0.40 weight.
-SIZE_MIX_MC_SHORT = 0.20
-SIZE_MIX_MC_LONG = 0.40
-SIZE_MIX_MC_TAU_H = 2.0
-# Size sigma is horizon-adaptive: the trend normal's sd in log10 cap.
-# At a short horizon the place-k cap is pinned by the cut (sigma ~0.15);
-# at the final's ~10 h horizon the honest width is ~0.50. sigma(h) =
-# SIZE_SD_A + SIZE_SD_B * sqrt(h) so the same code is tight on the
-# 1-2 h practice and wide on the 7-13 h final. (The old fixed 0.45 was
-# far too wide for the practice and wasted size mass over ~36 bins.)
-SIZE_SD_A = 0.15
-SIZE_SD_B = 0.11
-# --- v4 crash hazard (sizes only) ---------------------------------------
-# A coin's log-cap does not just diffuse: with a per-hour hazard it
-# CRASHES by ~0.55 log10 (measured: top-20 coins fall >0.3 with
-# p=0.176/0.188/0.240 within 10/20/30 min, i.e. lambda ~= 0.6/h; the
-# fall among crashed coins is tight, mean -0.55, sd ~0.15). The size
-# trend normal therefore becomes a mixture: with probability
-# 1-p_crash(h) the drifted normal, with probability p_crash(h) a
-# crashed normal centred CRASH_DROP below it with CRASH_SD width.
-# p_crash grows with horizon (1-exp(-lambda*h)) but is capped at
-# CRASH_P_MAX so the crashed component never dominates entirely at the
-# final's 7-13 h horizons, where the cohort is mature and the
-# conditional hazard is lower than in this young explosive practice.
-CRASH_LAMBDA = 0.6            # per-hour crash hazard (top-20 calibrated)
-CRASH_DROP = 0.55             # mean log10 fall of a crashed coin
-CRASH_SD = 0.25               # width of the crashed component
-CRASH_P_MAX = 0.5             # cap on the crash probability
+# Size model is v1's, fixed (not horizon-adaptive): the trend normal
+# has sd 0.45 and the Monte-Carlo histogram has weight 0.40. v2's
+# adaptive sigma (0.15 + 0.11*sqrt(h)) and adaptive mix (0.20 -> 0.40)
+# were far too tight at practice horizons and collapsed the size score
+# on the real practice (v2 size -23.07 vs v1 -17.99).
+SIZE_MIX_MC = 0.4             # weight of the Monte-Carlo histogram in sizes
+SIZE_MIX_SD = 0.45            # sd of the trend normal mixed into sizes
 DRIFT_TAU_H = 1.5             # cohort-level drift saturates over ~this long
 GROWTH_CAP_H = 2.5            # growth only extrapolates this far (hours)
 GROWTH_AGE_TAU_H = 4.0        # growth fades with coin age
-# Slope shrink is horizon-dependent: at a short horizon the last level
-# pins the answer and the estimated slope is mostly noise (the backtests
-# prefer ~0.25 there), while at a long horizon the slope is the growth
-# signal that separates coins still climbing from coins about to die,
-# so it earns a larger weight (~0.55 at the final's ~10 h).
-SLOPE_SHRINK_SHORT = 0.25
-SLOPE_SHRINK_LONG = 0.55
-SLOPE_SHRINK_TAU_H = 3.0
-REVERT_TAU_H = 12.0            # mean-reversion time (hours)
+# Slope shrink is v1's fixed 0.5: slopes do not persist.
+REVERT_TAU_H = 8.0             # mean-reversion time (hours, v1)
 # The per-coin sigma's random-walk term saturates: a coin's log-cap does
 # not random-walk without bound (it peaks and decays), so the horizon
 # entering sigma2 is capped at SIGMA_TAU_H of effective hours. At the
@@ -306,9 +231,7 @@ def predict_coin(obs, cut_epoch, horizon_h):
     age_h = max(0.0, (cut_epoch - created) / 3600.0) if created else 24.0
 
     slope = fit_slope(obs)
-    shrink = SLOPE_SHRINK_SHORT + (SLOPE_SHRINK_LONG - SLOPE_SHRINK_SHORT) * (
-        1.0 - math.exp(-horizon_h / SLOPE_SHRINK_TAU_H))
-    slope = max(-1.0, min(1.5, slope)) * shrink
+    slope = max(-1.0, min(1.5, slope)) * 0.5  # shrink: slopes do not persist (v1 fixed)
     growth = slope * min(horizon_h, GROWTH_CAP_H) * math.exp(-age_h / GROWTH_AGE_TAU_H)
 
     level = LONG_RUN.get(venue, 1.7)
@@ -390,7 +313,7 @@ def build_forecast(task, marks):
                       for i in range(max(0, len(p1_series) - 4), len(p1_series) - 1))
         cadence = float(task.get("cadence_minutes") or 10)
         drift_per_hour = incs[len(incs) // 2] * (60.0 / cadence)
-        g = max(0.0, min(1.2, drift_per_hour * 1.0))  # trust the measured cohort drift
+        g = max(0.0, min(0.6, drift_per_hour * 0.5))  # v1: half-trust the drift
     else:
         g = 0.3
     h_drift = DRIFT_TAU_H * (1.0 - math.exp(-horizon_h / DRIFT_TAU_H))
@@ -575,17 +498,7 @@ def build_forecast(task, marks):
     # Monte-Carlo cannot see and which take most top-5 places at long
     # horizons; without it the sizes sit far too low. (last_caps, g and
     # h_drift were computed above, before the Monte-Carlo.)
-    # Horizon-adaptive size sigma (see SIZE_SD_A / SIZE_SD_B above).
-    size_sd = SIZE_SD_A + SIZE_SD_B * math.sqrt(horizon_h)
-    # Horizon-adaptive MC mix weight: the trend normal dominates at
-    # short horizons, the MC histogram earns its full weight at long ones.
-    mix_mc = SIZE_MIX_MC_SHORT + (SIZE_MIX_MC_LONG - SIZE_MIX_MC_SHORT) * (
-        1.0 - math.exp(-horizon_h / SIZE_MIX_MC_TAU_H))
-    # v4 crash hazard: with probability p_crash the place-k holder has
-    # crashed, so the trend component is a mixture of the drifted normal
-    # and a crashed normal CRASH_DROP below it. p_crash grows with
-    # horizon and is capped so it never dominates at long horizons.
-    p_crash = min(CRASH_P_MAX, 1.0 - math.exp(-CRASH_LAMBDA * horizon_h))
+    # Size model is v1's, fixed: trend normal sd 0.45, MC mix 0.40.
     sizes = []
     for k in range(places):
         if n == 0 or N_SIMS == 0:
@@ -599,26 +512,18 @@ def build_forecast(task, marks):
             center = max(cap_k, cap_1 - 0.10 * k) + g * h_drift
             center = min(center, cap_1 + 0.8)
             center = max(center, cap_k)
-            sd = size_sd
+            sd = SIZE_MIX_SD
         else:
             center = mean
-            sd = max(size_sd, sd_mc)
+            sd = max(SIZE_MIX_SD, sd_mc)
         probs = []
         total = 0.0
-        crash_center = center - CRASH_DROP
         for b in range(n_bins):
             mc = place_bin_counts[k][b] / N_SIMS
             lo = -math.inf if b == 0 else edges[b - 1]
             hi = math.inf if b == n_bins - 1 else edges[b]
-            # v4: trend component is the crash mixture, not a single
-            # normal -- (1-p) drifted normal + p crashed normal.
-            broad = ((1.0 - p_crash)
-                     * (norm_cdf((hi - center) / sd)
-                        - norm_cdf((lo - center) / sd))
-                     + p_crash
-                     * (norm_cdf((hi - crash_center) / CRASH_SD)
-                        - norm_cdf((lo - crash_center) / CRASH_SD)))
-            p = (mix_mc * mc + (1.0 - mix_mc) * broad) * SIZE_NAMED_SUM
+            broad = norm_cdf((hi - center) / sd) - norm_cdf((lo - center) / sd)
+            p = (SIZE_MIX_MC * mc + (1.0 - SIZE_MIX_MC) * broad) * SIZE_NAMED_SUM
             p = floor6(p)
             if p >= MIN_NAMED_P:
                 probs.append((b, p))
