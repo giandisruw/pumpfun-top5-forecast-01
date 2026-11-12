@@ -5,7 +5,25 @@ Reads $MAKEFUN_INPUT_DIR/history.ndjson + task.json (defaults /input) and
 writes $MAKEFUN_OUTPUT_DIR/forecast.json (default /output). Python 3.13,
 standard library only, no network, deterministic (fixed RNG seed).
 
-Model (v2; the house baseline is a different, simpler program):
+Model (v3; the house baseline is a different, simpler program):
+  * Each coin's log10 market cap (in SOL) is tracked across the marks it
+    appears in: last level, recent slope (least squares over the last few
+    marks), venue and age.
+  * v3 change: N_NEW_MAX 3.0 -> 6.0 (the cap on expected newborn coins
+    reaching the top 5). v2 scored -41.4 on the real practice (rank
+    399/459) with the size score collapsing to -23.07 (v1: -17.99) --
+    the entry rate is hundreds/hour, so the newcomer count lam is large
+    and the cap binds hard; v2 underestimated the displacement of named
+    leaders by fresh coins on the later reads. Multi-read backtest
+    (scores a forecast against ALL future marks, not one): v2 -32.70,
+    v3 -32.16 (+0.54). Rejected by the same backtest: drift-shrink
+    1.0 -> 0.5 and size-sigma widening (both worse on the backtest, even
+    though v1's wider size scored better on the real practice -- the
+    local backtests only cover the explosive phase and cannot reproduce
+    the real practice's drift deceleration, so they are a biased proxy
+    for size parameters; the newcomer cap is the one lever that improves
+    both the backtest and, by the v1-vs-v2 leaderboard evidence, the
+    real practice).
   * Each coin's log10 market cap (in SOL) is tracked across the marks it
     appears in: last level, recent slope (least squares over the last few
     marks), venue and age.
@@ -74,7 +92,15 @@ N_CANDIDATES = 150
 # A newcomer's cap is ~Normal(NEW_CAP_CENTER, NEW_CAP_SD), centred on
 # the cohort's place-3 level: in the practice the newborn top-5 coins
 # landed at 3.10-3.47 while place 1 sat at 3.56.
-N_NEW_MAX = 3.0
+N_NEW_MAX = 6.0  # v3: raised from 3.0 (see sweep notes below).
+# v3 note: the entry rate is hundreds/hour, so lam = 0.20*rate*h is large
+# and this cap binds hard. v2's 3.0 underestimated how many fresh coins
+# displace the named leaders, especially on later reads where composition
+# churns. Multi-read backtest: 3.0 -> -32.70, 4.0 -> -32.38, 5.0 -> -32.18,
+# 6.0 -> -32.16 (best), 8.0 -> -32.25 (order degrades past the optimum).
+# The real practice horizon (mid 0.667h, reads to 1.17h) is longer than
+# the backtest's max 0.5h, so the cap binds even harder there -- 6.0 is
+# the safer side of the optimum for the real grading window.
 N_NEW_H_SAT = 2.0           # horizon beyond this adds no more newcomers
 NEW_CAP_SD = 0.25
 FILLER_P = 0.000001         # p for chart-filler rows (see below)
